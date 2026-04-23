@@ -32,7 +32,8 @@ export class AStar {
   findPath(
     startId: string,
     goalId: string,
-    requireAccessible: boolean = false
+    requireAccessible: boolean = false,
+    preferSideStairs: boolean = false
   ): PathResult {
     // Validate nodes exist
     if (!this.graph.hasNode(startId) || !this.graph.hasNode(goalId)) {
@@ -73,25 +74,32 @@ export class AStar {
       for (const edge of neighbors) {
         const neighbor = edge.to
 
-        // Skip if already evaluated
-        if (closedSet.has(neighbor)) continue
+       // Skip if already evaluated
+               if (closedSet.has(neighbor)) continue
 
-        // IMPORTANT: Don't route THROUGH rooms - only allow entering rooms if they're the goal
-        const node = this.graph.getNode(neighbor)
-        if (node?.type === 'room' && neighbor !== goalId) {
-          continue // Skip this room - it's not our destination
-        }
+               // Rooms are terminal-only — never route THROUGH a room
+               const neighborNode = this.graph.getNode(neighbor)
+               if ((neighborNode?.type === 'room' || neighborNode?.type === 'door') && neighbor !== goalId) continue
 
-        // Calculate tentative g score
-        const currentNode = nodes.get(current)!
-        const tentativeG = currentNode.g + edge.weight
+               // Add penalty to discourage certain stair types
+               let stairPenalty = 0
+               if (neighborNode?.type === 'stairs') {
+                 const isSideStair = ['stairs_1','stairs_f1_2','stairs_f2_2','stairs_f3_2'].includes(neighbor)
+                 const isMainStair = ['stairs_2','stairs_f1_1','stairs_f2_1','stairs_f3_1'].includes(neighbor)
+                 if (preferSideStairs && isMainStair) stairPenalty = 500
+                 if (!preferSideStairs && isSideStair) stairPenalty = 500
+               }
+
+               // Calculate tentative g score
+               const currentNode = nodes.get(current)!
+               const tentativeGWithPenalty = currentNode.g + edge.weight + stairPenalty
 
         // Discover a new node or find a better path
         if (!openSet.has(neighbor)) {
           openSet.add(neighbor)
         } else {
           const existingNode = nodes.get(neighbor)
-          if (existingNode && tentativeG >= existingNode.g) {
+          if (existingNode && tentativeGWithPenalty >= existingNode.g) {
             continue // This is not a better path
           }
         }
@@ -100,9 +108,9 @@ export class AStar {
         const h = this.graph.getDistance(neighbor, goalId)
         nodes.set(neighbor, {
           id: neighbor,
-          g: tentativeG,
+          g: tentativeGWithPenalty,
           h: h,
-          f: tentativeG + h,
+          f: tentativeGWithPenalty + h,
           parent: current
         })
       }

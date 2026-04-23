@@ -7,858 +7,846 @@ import { AStar } from '../utils/pathfinding'
 import { PathNode } from '../types'
 import { BuildingGeometry } from '../utils/BuildingGeometry'
 import { CameraWalkthrough } from '../utils/CameraWalkthrough'
-import exampleBuildingData from '../data/buildings_example.json'
+import { generateNavInstructions, speakInstructions, stopSpeech, NavInstruction } from '../utils/navigationInstructions'
 import csisBuildingData from '../data/buildings_csis.json'
 
-// Building options
+const SCALE = 10
+const FLOOR_HEIGHT = 150
+const WALL_HEIGHT = 125
+const WALL_THICKNESS = 8
+// Shared materials — defined once, never recreated
+const MAT_FLOOR      = new THREE.MeshStandardMaterial({ color: 0x2a2a3e, roughness: 0.8 })
+const MAT_FLOOR_DARK = new THREE.MeshStandardMaterial({ color: 0x252535, roughness: 0.8 })
+const MAT_CEILING    = new THREE.MeshStandardMaterial({ color: 0xf0f0f0, roughness: 0.9 })
+const MAT_ROOM       = new THREE.MeshStandardMaterial({ color: 0x1e3a5f, roughness: 0.8, transparent: true, opacity: 0.55 })
+const MAT_ENTRANCE   = new THREE.MeshStandardMaterial({ color: 0x22c55e, emissive: 0x22c55e, emissiveIntensity: 0.3 })
+const MAT_PATH       = new THREE.MeshStandardMaterial({ color: 0xff4444, emissive: 0xff4444, emissiveIntensity: 0.5 })
+
 const BUILDINGS = {
-  example: { name: "Example Building", data: exampleBuildingData },
-  csis: { name: "CSIS Building", data: csisBuildingData }
+  csis: { name: 'CSIS Building', data: csisBuildingData as any },
 }
 
 function Viewer3D() {
+    const pathRef = useRef<PathNode[]>([])
   const navigate = useNavigate()
   const containerRef = useRef<HTMLDivElement>(null)
   const sceneRef = useRef<THREE.Scene | null>(null)
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null)
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null)
   const controlsRef = useRef<OrbitControls | null>(null)
+  const walkthroughRef = useRef<CameraWalkthrough | null>(null)
+  const floorOffsetsRef = useRef<Map<number, { x: number; z: number }>>(new Map())
 
-  // Building selection
-  const [selectedBuilding, setSelectedBuilding] = useState<'example' | 'csis'>('example')
+  const [selectedBuilding] = useState<'csis'>('csis')
   const buildingData = BUILDINGS[selectedBuilding].data
 
   const [graph, setGraph] = useState<Graph | null>(null)
   const [pathfinder, setPathfinder] = useState<AStar | null>(null)
-  const [startRoom, setStartRoom] = useState<string>('')
-  const [endRoom, setEndRoom] = useState<string>('')
+  const [startRoom, setStartRoom] = useState('')
+  const [endRoom, setEndRoom] = useState('')
   const [path, setPath] = useState<PathNode[]>([])
   const [requireAccessible, setRequireAccessible] = useState(false)
-  const [visibleFloors, setVisibleFloors] = useState<Set<number>>(new Set([0, 1])) // Both floors visible by default
-  const maxFloor = 1
-
-  // Wall and ceiling visibility per floor
-  const [floorWallsVisible, setFloorWallsVisible] = useState<{[floor: number]: boolean}>({
-    0: true,
-    1: true
+  const [visibleFloors, setVisibleFloors] = useState<Set<number>>(new Set([0]))
+  const [floorWallsVisible, setFloorWallsVisible] = useState<Record<number, boolean>>({
+    0: true, 1: true, 2: true, 3: true,
   })
-  const [floorCeilingsVisible, setFloorCeilingsVisible] = useState<{[floor: number]: boolean}>({
-    0: true,
-    1: true
+  const [floorCeilingsVisible, setFloorCeilingsVisible] = useState<Record<number, boolean>>({
+    0: false, 1: false, 2: false, 3: false,
   })
-
-  // Walkthrough state
   const [walkthroughActive, setWalkthroughActive] = useState(false)
   const [walkthroughPlaying, setWalkthroughPlaying] = useState(false)
   const [walkthroughProgress, setWalkthroughProgress] = useState(0)
   const [walkthroughSpeed, setWalkthroughSpeed] = useState(1.0)
-  const walkthroughRef = useRef<CameraWalkthrough | null>(null)
+  const [useSideStairs, setUseSideStairs] = useState(false)
+  const [stairTransitionMsg, setStairTransitionMsg] = useState<string | null>(null)
+  const [navInstructions, setNavInstructions] = useState<NavInstruction[]>([])
+  const [voiceMuted, setVoiceMuted] = useState(false)
+  const [showInstructions, setShowInstructions] = useState(true)
+  const savedCameraStateRef = useRef<{ pos: THREE.Vector3; target: THREE.Vector3 } | null>(null)
 
-  // Initialize graph and pathfinder
+  // ── Load graph ─────────────────────────────────────────────────────────────
   useEffect(() => {
-    console.log('Loading building data...', selectedBuilding)
     const g = new Graph()
-
-    buildingData.nodes.forEach(node => {
-      g.addNode(node as PathNode)
-    })
-
-    buildingData.edges.forEach(edge => {
-      g.addEdge(edge)
-    })
-
-    console.log('Graph loaded with', g.getAllNodes().length, 'nodes')
+    buildingData.nodes.forEach((node: PathNode) => g.addNode(node))
+    buildingData.edges.forEach((edge: any) => g.addEdge(edge))
     setGraph(g)
     setPathfinder(new AStar(g))
-
-    // Reset selections when building changes
     setStartRoom('')
     setEndRoom('')
     setPath([])
     setVisibleFloors(new Set([0]))
-  }, [selectedBuilding, buildingData])
+  }, [selectedBuilding])
 
-  // Initialize Three.js scene
-  useEffect(() => {
-    if (!containerRef.current) return
+  // ── Three.js scene init ────────────────────────────────────────────────────
+    useEffect(() => {
+      if (!containerRef.current) return
+      // Dispose any existing renderer first
+      if (rendererRef.current) {
+        rendererRef.current.dispose()
+        rendererRef.current = null
+      }
 
-    // Prevent double initialization in React Strict Mode
-    if (rendererRef.current) return
-
-    // Scene setup
     const scene = new THREE.Scene()
     scene.background = new THREE.Color(0x1a1a2e)
-    scene.fog = new THREE.Fog(0x1a1a2e, 500, 2000)
+    scene.fog = new THREE.Fog(0x1a1a2e, 1500, 4000)
     sceneRef.current = scene
 
-    // Camera setup
     const camera = new THREE.PerspectiveCamera(
-      75,
+      60,
       containerRef.current.clientWidth / containerRef.current.clientHeight,
       0.1,
-      3000
+      5000
     )
-    camera.position.set(400, 600, 800)
+    camera.position.set(600, 900, 1200)
     camera.lookAt(0, 0, 0)
     cameraRef.current = camera
 
-    // Initialize walkthrough system
-    const walkthrough = new CameraWalkthrough(camera)
-    walkthrough.onProgress((progress) => {
-      setWalkthroughProgress(progress)
+    const walkthrough = new CameraWalkthrough(camera, 0, 0, FLOOR_HEIGHT)
+    walkthrough.setProgressCallback((p) => {
+      // Only update React state every 10 frames to reduce re-renders
+      if (Math.round(p * 100) % 2 === 0) setWalkthroughProgress(p)
     })
-    walkthrough.onFinish(() => {
-      setWalkthroughPlaying(false)
-    })
+    walkthrough.setCompletionCallback(() => setWalkthroughPlaying(false))
     walkthroughRef.current = walkthrough
+    walkthrough.setFloorTransitionCallback((fromFloor, toFloor) => {
+          const label = toFloor === 0 ? 'Ground Floor' : `Floor ${toFloor}`
+          setStairTransitionMsg(`🪜 Taking stairs to ${label}…`)
+          setTimeout(() => setStairTransitionMsg(null), 2000)
+        })
 
-    // Renderer setup
-    const renderer = new THREE.WebGLRenderer({ antialias: true })
+    const renderer = new THREE.WebGLRenderer({ antialias: false })
     renderer.setSize(containerRef.current.clientWidth, containerRef.current.clientHeight)
-    renderer.setPixelRatio(window.devicePixelRatio)
-    renderer.shadowMap.enabled = true
-    renderer.shadowMap.type = THREE.PCFSoftShadowMap
+    renderer.setPixelRatio(1)
+    renderer.shadowMap.enabled = false
     containerRef.current.appendChild(renderer.domElement)
     rendererRef.current = renderer
 
-    // Controls setup
     const controls = new OrbitControls(camera, renderer.domElement)
     controls.enableDamping = true
     controls.dampingFactor = 0.05
     controls.minDistance = 200
-    controls.maxDistance = 1500
+    controls.maxDistance = 3000
     controls.maxPolarAngle = Math.PI / 2.1
     controlsRef.current = controls
 
-    // Lighting
-    const ambientLight = new THREE.AmbientLight(0xffffff, 0.5)
-    scene.add(ambientLight)
+    scene.add(new THREE.AmbientLight(0xffffff, 0.55))
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.9)
+    dirLight.position.set(300, 500, 400)
+    scene.add(dirLight)
 
-    const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8)
-    directionalLight.position.set(100, 200, 100)
-    directionalLight.castShadow = true
-    directionalLight.shadow.camera.left = -500
-    directionalLight.shadow.camera.right = 500
-    directionalLight.shadow.camera.top = 500
-    directionalLight.shadow.camera.bottom = -500
-    scene.add(directionalLight)
+    const grid = new THREE.GridHelper(2000, 30, 0x444444, 0x222222)
+    scene.add(grid)
 
-    // Grid helper (only one)
-    const gridHelper = new THREE.GridHelper(1000, 20, 0x444444, 0x222222)
-    scene.add(gridHelper)
-
-    // Animation loop
     let lastTime = 0
-    const animate = (currentTime: number) => {
+    const animate = (t: number) => {
       requestAnimationFrame(animate)
-
-      const delta = (currentTime - lastTime) / 1000 // Convert to seconds
-      lastTime = currentTime
-
-      // Update walkthrough if active
-      if (walkthroughRef.current) {
+      const delta = (t - lastTime) / 1000
+      lastTime = t
+      if (walkthroughRef.current?.isActive()) {
         walkthroughRef.current.update(delta)
-
-        // Disable orbit controls during walkthrough
-        if (walkthroughRef.current.isActive()) {
-          controls.enabled = false
-        } else {
-          controls.enabled = true
-        }
+        controls.enabled = false
+      } else {
+        controls.enabled = true
+        controls.update()
+        controls.update()
+                savedCameraStateRef.current = {
+                  pos: camera.position.clone(),
+                  target: controls.target.clone()
+                }
       }
-
-      controls.update()
       renderer.render(scene, camera)
     }
     animate(0)
 
-    // Handle window resize
-    const handleResize = () => {
-      if (!containerRef.current || !camera || !renderer) return
-
+    const onResize = () => {
+      if (!containerRef.current) return
       camera.aspect = containerRef.current.clientWidth / containerRef.current.clientHeight
       camera.updateProjectionMatrix()
       renderer.setSize(containerRef.current.clientWidth, containerRef.current.clientHeight)
     }
-    window.addEventListener('resize', handleResize)
+    window.addEventListener('resize', onResize)
 
-    // Cleanup
     return () => {
-      window.removeEventListener('resize', handleResize)
-      if (containerRef.current && renderer.domElement.parentElement === containerRef.current) {
+      window.removeEventListener('resize', onResize)
+      if (containerRef.current?.contains(renderer.domElement))
         containerRef.current.removeChild(renderer.domElement)
-      }
       renderer.dispose()
+      renderer.forceContextLoss()
       rendererRef.current = null
     }
   }, [])
 
-  // Build 3D structure when graph is loaded
+  // ── Rebuild 3D when graph/visibility changes ───────────────────────────────
   useEffect(() => {
     if (graph && sceneRef.current) {
-      console.log('Building 3D structure with', graph.getAllNodes().length, 'nodes')
-      build3DStructure(sceneRef.current, graph)
+      // Save camera state before rebuild
+      const saved = savedCameraStateRef.current
+          build3DStructure(sceneRef.current, graph)
+          if (saved && controlsRef.current && cameraRef.current) {
+            cameraRef.current.position.copy(saved.pos)
+            controlsRef.current.target.copy(saved.target)
+            controlsRef.current.update()
+          }
     }
-  }, [graph])
+  }, [graph, visibleFloors, floorWallsVisible, floorCeilingsVisible])
 
-  // Rebuild 3D structure when visible floors change
-  useEffect(() => {
-    if (graph && sceneRef.current) {
-      console.log('Updating visible floors:', Array.from(visibleFloors))
-      build3DStructure(sceneRef.current, graph)
-    }
-  }, [visibleFloors, floorWallsVisible, floorCeilingsVisible, graph])
-
-  // Toggle floor visibility
-  const toggleFloor = (floorNumber: number) => {
-    setVisibleFloors(prev => {
-      const newSet = new Set(prev)
-      if (newSet.has(floorNumber)) {
-        newSet.delete(floorNumber)
-      } else {
-        newSet.add(floorNumber)
-      }
-      return newSet
-    })
-  }
-
-  // Toggle walls for a specific floor
-  const toggleFloorWalls = (floorNumber: number) => {
-    setFloorWallsVisible(prev => ({
-      ...prev,
-      [floorNumber]: !prev[floorNumber]
-    }))
-  }
-
-  // Toggle ceiling for a specific floor
-  const toggleFloorCeiling = (floorNumber: number) => {
-    setFloorCeilingsVisible(prev => ({
-      ...prev,
-      [floorNumber]: !prev[floorNumber]
-    }))
-  }
-
-  // Auto-show floors based on path
+  // ── Auto-show floors when path changes ────────────────────────────────────
   useEffect(() => {
     if (path.length > 0) {
-      const floorsInPath = new Set(path.map(node => node.floor))
-      setVisibleFloors(floorsInPath)
-
-      // Setup walkthrough with new path
-      if (walkthroughRef.current) {
-        walkthroughRef.current.setPath(path)
-        setWalkthroughActive(false)
-        setWalkthroughPlaying(false)
-        setWalkthroughProgress(0)
-      }
+        pathRef.current = path
+      setVisibleFloors(new Set(path.map((n) => n.floor)))
+      setWalkthroughActive(false)
+      setWalkthroughPlaying(false)
+      setWalkthroughProgress(0)
     }
   }, [path])
 
-  // Build 3D structure from graph data
+  // ── Core 3D structure builder ──────────────────────────────────────────────
   const build3DStructure = (scene: THREE.Scene, graph: Graph) => {
-    // Remove existing building objects if they exist
-    const existingObjects = scene.children.filter(obj =>
-      obj.userData.isBuilding === true
-    )
-    existingObjects.forEach(obj => scene.remove(obj))
+    // Remove old building geometry
+    // Remove AND dispose old building geometry to free GPU memory
+    const toRemove = scene.children.filter((o) => o.userData.isBuilding)
+    toRemove.forEach((o) => {
+      scene.remove(o)
+      if (o instanceof THREE.Mesh) {
+        o.geometry.dispose()
+      } else if (o instanceof THREE.Group) {
+        o.traverse((child) => {
+          if (child instanceof THREE.Mesh) child.geometry.dispose()
+        })
+      }
+    })
 
     const nodes = graph.getAllNodes()
-    const floorHeight = 150
-    const scale = 1
-
-    // Calculate center offset to center building on grid
-    const offsetX = -425
-    const offsetZ = -325
-
-    // Initialize building geometry helper
-    const buildingGeom = new BuildingGeometry(scene, offsetX, offsetZ)
+    const wallsByFloor: Record<string, Array<{ from: [number, number]; to: [number, number] }>> =
+          buildingData.walls_by_floor || {}
+    const roomPolygonsByFloor: Record<string, Array<{ id: string; label: string; polygon: [number, number][] }>> =
+          buildingData.room_polygons_by_floor || {}
 
     // Group nodes by floor
     const floors = new Map<number, PathNode[]>()
-    nodes.forEach(node => {
-      if (!floors.has(node.floor)) {
-        floors.set(node.floor, [])
-      }
-      floors.get(node.floor)?.push(node)
+    nodes.forEach((node) => {
+      if (!floors.has(node.floor)) floors.set(node.floor, [])
+      floors.get(node.floor)!.push(node)
     })
 
-    // Build each floor (only if visible)
-    floors.forEach((nodesOnThisFloor, floorNumber) => {
-      // Skip if floor is not visible
-      if (!visibleFloors.has(floorNumber)) {
-        return
+    // Compute per-floor centering offsets from wall bounds
+    // Build a node lookup map
+    const nodeMap = new Map<string, PathNode>()
+    nodes.forEach((n) => nodeMap.set(n.id, n))
+
+    const edges: Array<{ from: string; to: string }> = buildingData.edges || []
+
+    // Helper: compute wall-centre offset for a floor
+    const wallCentreOffset = (floorNum: number): { x: number; z: number } => {
+      const walls = wallsByFloor[floorNum.toString()] || []
+      if (walls.length > 0) {
+        const allX = walls.flatMap((w) => [w.from[0], w.to[0]])
+        const allZ = walls.flatMap((w) => [w.from[1], w.to[1]])
+        const cx = (Math.min(...allX) + Math.max(...allX)) / 2
+        const cz = (Math.min(...allZ) + Math.max(...allZ)) / 2
+        return { x: -cx * SCALE, z: -cz * SCALE }
+      }
+      const fn = nodes.filter((n) => n.floor === floorNum)
+      if (fn.length > 0) {
+        const allX = fn.map((n) => n.x)
+        const allZ = fn.map((n) => n.y)
+        const cx = (Math.min(...allX) + Math.max(...allX)) / 2
+        const cz = (Math.min(...allZ) + Math.max(...allZ)) / 2
+        return { x: -cx * SCALE, z: -cz * SCALE }
+      }
+      return { x: 0, z: 0 }
+    }
+
+    // Ground floor is the anchor — centred from its own wall bounds
+    const floorOffsets = new Map<number, { x: number; z: number }>()
+    floorOffsets.set(0, wallCentreOffset(0))
+
+    // For every floor above, find a cross-floor stair/elevator edge and
+    // snap that node's world position to match its counterpart below
+    for (let floor = 1; floor <= 3; floor++) {
+      let anchor: { lower: PathNode; upper: PathNode } | null = null
+
+      for (const edge of edges) {
+        const a = nodeMap.get(edge.from)
+        const b = nodeMap.get(edge.to)
+        if (!a || !b) continue
+        const isVertical = (a.type === 'stairs' || a.type === 'elevator') &&
+                           (b.type === 'stairs' || b.type === 'elevator')
+        if (!isVertical) continue
+        if (a.floor === floor - 1 && b.floor === floor) { anchor = { lower: a, upper: b }; break }
+        if (b.floor === floor - 1 && a.floor === floor) { anchor = { lower: b, upper: a }; break }
       }
 
-      const yPosition = floorNumber * floorHeight
-
-      // Add exterior walls for this floor (dynamically calculated) - only if walls are visible
-      if (floorWallsVisible[floorNumber]) {
-        buildingGeom.createExteriorWalls(floorNumber, floorHeight, nodes)
-      }
-
-      // Add ceiling for this floor (dynamically sized) - only if ceiling is visible
-      if (floorCeilingsVisible[floorNumber]) {
-        buildingGeom.createCeiling(floorNumber, floorHeight, nodes)
-      }
-
-      // Floor plane (dynamically sized)
-      if (nodesOnThisFloor.length > 0) {
-        const xCoords = nodesOnThisFloor.map(n => n.x)
-        const zCoords = nodesOnThisFloor.map(n => n.y)
-        const padding = 25
-
-        const minX = Math.min(...xCoords) - padding
-        const maxX = Math.max(...xCoords) + padding
-        const minZ = Math.min(...zCoords) - padding
-        const maxZ = Math.max(...zCoords) + padding
-
-        const width = maxX - minX
-        const depth = maxZ - minZ
-        const centerX = (minX + maxX) / 2
-        const centerZ = (minZ + maxZ) / 2
-
-        const floorGeometry = new THREE.BoxGeometry(width, 5, depth)
-        const floorMaterial = new THREE.MeshStandardMaterial({
-          color: 0x2a2a3e,
-          roughness: 0.8,
-          metalness: 0.2
-        })
-        const floorMesh = new THREE.Mesh(floorGeometry, floorMaterial)
-        floorMesh.position.set(centerX + offsetX, yPosition - 2.5, centerZ + offsetZ)
-        floorMesh.receiveShadow = true
-        floorMesh.userData.isBuilding = true
-        scene.add(floorMesh)
-      }
-
-      // Draw rooms with walls
-      const rooms = nodesOnThisFloor.filter(n => n.type === 'room')
-      rooms.forEach(room => {
-        // Create room walls and door - only if walls are visible
-        if (floorWallsVisible[floorNumber]) {
-          buildingGeom.createRoomWalls(room.x, room.y, floorNumber, floorHeight)
-        }
-
-        // Room label (sprite)
-        if (room.label) {
-          const canvas = document.createElement('canvas')
-          const context = canvas.getContext('2d')
-          if (context) {
-            canvas.width = 256
-            canvas.height = 128
-            context.fillStyle = 'white'
-            context.font = 'bold 48px Arial'
-            context.textAlign = 'center'
-            context.fillText(room.label, 128, 80)
-
-            const texture = new THREE.CanvasTexture(canvas)
-            const spriteMaterial = new THREE.SpriteMaterial({ map: texture })
-            const sprite = new THREE.Sprite(spriteMaterial)
-            sprite.position.set(room.x * scale + offsetX, yPosition + 110, room.y * scale + offsetZ)
-            sprite.scale.set(60, 30, 1)
-            sprite.userData.isBuilding = true
-            scene.add(sprite)
-          }
-        }
-      })
-
-      // Draw corridor markers (small cylinders to show path nodes)
-      const corridors = nodesOnThisFloor.filter(n => n.type === 'corridor')
-      corridors.forEach(corridor => {
-        const corridorGeometry = new THREE.CylinderGeometry(5, 5, 5, 16)
-        const corridorMaterial = new THREE.MeshStandardMaterial({
-          color: 0x888888,
-          roughness: 0.7
-        })
-        const corridorMesh = new THREE.Mesh(corridorGeometry, corridorMaterial)
-        corridorMesh.position.set(corridor.x * scale + offsetX, yPosition + 2.5, corridor.y * scale + offsetZ)
-        corridorMesh.userData.isBuilding = true
-        scene.add(corridorMesh)
-      })
-
-      // Draw entrances
-      const entrances = nodesOnThisFloor.filter(n => n.type === 'entrance')
-      entrances.forEach(entrance => {
-        const entranceGeometry = new THREE.CylinderGeometry(15, 15, 20, 16)
-        const entranceMaterial = new THREE.MeshStandardMaterial({
-          color: 0x22c55e,
-          emissive: 0x22c55e,
-          emissiveIntensity: 0.3
-        })
-        const entranceMesh = new THREE.Mesh(entranceGeometry, entranceMaterial)
-        entranceMesh.position.set(entrance.x * scale + offsetX, yPosition + 10, entrance.y * scale + offsetZ)
-        entranceMesh.userData.isBuilding = true
-        scene.add(entranceMesh)
-      })
-
-      // Draw stairs (only create 3D stairs for ground floor, they extend to next floor)
-      if (floorNumber === 0) {
-        const stairs = nodesOnThisFloor.filter(n => n.type === 'stairs')
-        stairs.forEach(stair => {
-          buildingGeom.createStairs(stair.x, stair.y, floorNumber, floorHeight)
+      if (anchor && floorOffsets.has(floor - 1)) {
+        const lowerOff = floorOffsets.get(floor - 1)!
+        // World XZ of the lower stair/lift
+        const worldX = anchor.lower.x * SCALE + lowerOff.x
+        const worldZ = anchor.lower.y * SCALE + lowerOff.z
+        // Offset that places the upper stair/lift at the same world XZ
+        floorOffsets.set(floor, {
+          x: worldX - anchor.upper.x * SCALE,
+          z: worldZ - anchor.upper.y * SCALE,
         })
       } else {
-        // Just show a platform at the top of stairs on upper floors
-        const stairs = nodesOnThisFloor.filter(n => n.type === 'stairs')
-        stairs.forEach(stair => {
-          const platformGeometry = new THREE.BoxGeometry(40, 5, 40)
-          const platformMaterial = new THREE.MeshStandardMaterial({
-            color: 0xec4899,
-            roughness: 0.6
-          })
-          const platform = new THREE.Mesh(platformGeometry, platformMaterial)
-          platform.position.set(stair.x + offsetX, yPosition, stair.y + offsetZ)
-          platform.userData.isBuilding = true
-          scene.add(platform)
-        })
+        // No cross-floor edge found — fall back to wall-centre
+        floorOffsets.set(floor, wallCentreOffset(floor))
       }
-    })
+    }
 
-    // Create elevator shaft (spans all floors, only create once)
-    if (visibleFloors.size > 0) {
-      const elevatorNodes = nodes.filter(n => n.type === 'elevator')
-      if (elevatorNodes.length > 0) {
-        // Get unique elevator positions
-        const uniqueElevators = new Map<string, PathNode>()
-        elevatorNodes.forEach(node => {
-          const key = `${node.x},${node.y}`
-          if (!uniqueElevators.has(key)) {
-            uniqueElevators.set(key, node)
+    floorOffsetsRef.current = floorOffsets
+    walkthroughRef.current?.setFloorOffsets(SCALE, floorOffsets)
+        // Re-set path on walkthrough now that floor offsets are correct
+        if (pathRef.current.length > 0) {
+          walkthroughRef.current?.setPath(pathRef.current)
+        }
+
+    floors.forEach((nodesOnFloor, floorNum) => {
+      if (!visibleFloors.has(floorNum)) return
+
+      const { x: offX, z: offZ } = floorOffsets.get(floorNum)!
+      const floorGeom = new BuildingGeometry(scene, offX, offZ)
+      const yPos = floorNum * FLOOR_HEIGHT
+      const floorWalls: Array<{ from: [number, number]; to: [number, number] }> =
+        (buildingData.walls_by_floor || {})[floorNum.toString()] || []
+
+      // ── Per-floor open/enclosed zone definitions (raw JSON coords) ───────
+      // Bridge = open walkway between room clusters (floor only, no ceiling)
+      // Enclosed = side-stairs corridor (floor + ceiling)
+      const BRIDGE_ZONES: Record<number, { minX: number; maxX: number; minZ: number; maxZ: number }[]> = {
+        1: [{ minX: 148, maxX: 304, minZ: 104, maxZ: 136 }],
+        2: [{ minX: 168, maxX: 324, minZ: 118, maxZ: 150 }],
+      }
+      const ENCLOSED_CORRIDOR_ZONES: Record<number, { minX: number; maxX: number; minZ: number; maxZ: number }[]> = {
+        1: [{ minX: 90, maxX: 165, minZ: 92, maxZ: 212 }],
+        2: [{ minX: 110, maxX: 185, minZ: 86, maxZ: 226 }],
+      }
+
+      // ── Room polygon floor + ceiling slabs ───────────────────────────────
+      const roomPolygonsForSlab = roomPolygonsByFloor[floorNum.toString()] || []
+
+      roomPolygonsForSlab.forEach((room) => {
+        // Floor
+        floorGeom.createRoomFloorPolygon(room.polygon, SCALE, floorNum, FLOOR_HEIGHT, 0x2a2a3e)
+        // Ceiling (if toggle on)
+        if (floorCeilingsVisible[floorNum]) {
+          floorGeom.createRoomFloorPolygon(
+            room.polygon, SCALE, floorNum, FLOOR_HEIGHT, 0xf0f0f0,
+            yPos + WALL_HEIGHT
+          )
+        }
+      })
+
+      // ── Floor slabs ────────────────────────────────────────────────────────
+      // Ground floor: single slab (building is fully enclosed on ground)
+      if (floorNum === 0 && floorWalls.length > 0) {
+        const boundsWalls = floorWalls.filter((w) => w.from[0] > -55 && w.to[0] > -55)
+        const validWalls = boundsWalls.length > 0 ? boundsWalls : floorWalls
+        const allX = validWalls.flatMap((w) => [w.from[0], w.to[0]])
+        const allZc = validWalls.flatMap((w) => [w.from[1], w.to[1]])
+        const slabW = (Math.max(...allX) - Math.min(...allX)) * SCALE
+        const slabD = (Math.max(...allZc) - Math.min(...allZc)) * SCALE
+        const slabCX = ((Math.min(...allX) + Math.max(...allX)) / 2) * SCALE + offX
+        const slabCZ = ((Math.min(...allZc) + Math.max(...allZc)) / 2) * SCALE + offZ
+        const gf = new THREE.Mesh(
+          new THREE.BoxGeometry(slabW, 5, slabD),
+          MAT_FLOOR
+        )
+        gf.position.set(slabCX, yPos - 2.5, slabCZ)
+        gf.userData.isBuilding = true
+        scene.add(gf)
+        if (floorCeilingsVisible[0]) {
+          const gc = new THREE.Mesh(
+            new THREE.BoxGeometry(slabW, 5, slabD),
+            MAT_CEILING
+          )
+          gc.position.set(slabCX, yPos + WALL_HEIGHT, slabCZ)
+          gc.userData.isBuilding = true
+          scene.add(gc)
+        }
+      }
+
+      // Floors 1-3: use room polygons + corridor zones (NOT bounding box)
+      if (floorNum >= 1) {
+        // Room polygon floor tiles
+        roomPolygonsForSlab.forEach((room) => {
+          const rxs = room.polygon.map((p: [number,number]) => p[0])
+          const rzs = room.polygon.map((p: [number,number]) => p[1])
+          const rMinX = Math.min(...rxs); const rMaxX = Math.max(...rxs)
+          const rMinZ = Math.min(...rzs); const rMaxZ = Math.max(...rzs)
+          const rW = (rMaxX - rMinX) * SCALE
+          const rD = (rMaxZ - rMinZ) * SCALE
+          const rCX = ((rMinX + rMaxX) / 2) * SCALE + offX
+          const rCZ = ((rMinZ + rMaxZ) / 2) * SCALE + offZ
+          // Floor tile
+          const rf = new THREE.Mesh(
+            new THREE.BoxGeometry(rW, 5, rD),
+            MAT_FLOOR
+          )
+          rf.position.set(rCX, yPos - 2.5, rCZ)
+          rf.userData.isBuilding = true
+          scene.add(rf)
+          // Ceiling tile
+          if (floorCeilingsVisible[floorNum]) {
+            const rc = new THREE.Mesh(
+              new THREE.BoxGeometry(rW, 5, rD),
+              MAT_CEILING
+            )
+            rc.position.set(rCX, yPos + WALL_HEIGHT, rCZ)
+            rc.userData.isBuilding = true
+            scene.add(rc)
           }
         })
 
-        uniqueElevators.forEach(elevator => {
-          buildingGeom.createElevatorShaft(elevator.x, elevator.y, 2, floorHeight)
+        // Corridor zone floor + ceiling tiles
+        const CORRIDOR_ZONES: Record<number, {minX:number;maxX:number;minZ:number;maxZ:number}[]> = {
+          1: [{ minX: 90, maxX: 304, minZ: 72, maxZ: 212 }],
+          2: [{ minX: 110, maxX: 324, minZ: 86, maxZ: 226 }],
+          3: [{ minX: 56, maxX: 216, minZ: 50, maxZ: 98 }],
+        }
+        ;(CORRIDOR_ZONES[floorNum] || []).forEach((zone) => {
+          const zW = (zone.maxX - zone.minX) * SCALE
+          const zD = (zone.maxZ - zone.minZ) * SCALE
+          const zCX = ((zone.minX + zone.maxX) / 2) * SCALE + offX
+          const zCZ = ((zone.minZ + zone.maxZ) / 2) * SCALE + offZ
+          const cf = new THREE.Mesh(
+            new THREE.BoxGeometry(zW, 5, zD),
+            MAT_FLOOR_DARK
+          )
+          cf.position.set(zCX, yPos - 2.5, zCZ)
+          cf.userData.isBuilding = true
+          scene.add(cf)
+          if (floorCeilingsVisible[floorNum]) {
+            const cc = new THREE.Mesh(
+              new THREE.BoxGeometry(zW, 5, zD),
+              MAT_CEILING
+            )
+            cc.position.set(zCX, yPos + WALL_HEIGHT, zCZ)
+            cc.userData.isBuilding = true
+            scene.add(cc)
+          }
         })
       }
-    }
-  }
 
-  // Calculate path when start or end changes
+      // ── Ground floor room footprints + labels ──────────────────────────────
+      if (floorNum === 0) {
+        nodesOnFloor.filter((n) => n.type === 'room').forEach((room) => {
+          const mesh = new THREE.Mesh(
+            new THREE.BoxGeometry(60, 4, 40),
+            MAT_ROOM
+          )
+          mesh.position.set(room.x * SCALE + offX, yPos + 3, room.y * SCALE + offZ)
+          mesh.userData.isBuilding = true
+          scene.add(mesh)
+          if (room.label) floorGeom.createRoomLabel(room.label, room.x * SCALE, room.y * SCALE, floorNum, FLOOR_HEIGHT)
+        })
+      }
+      // ── Walls from actual segments ───────────────────────────────────────
+      if (floorWallsVisible[floorNum] && floorWalls.length > 0) {
+        const doorNodesOnFloor = nodesOnFloor.filter((n) => n.type === 'door')
+                floorGeom.createWallSegments(
+                  floorWalls, SCALE, floorNum, FLOOR_HEIGHT, WALL_HEIGHT, WALL_THICKNESS,
+                  doorNodesOnFloor.map((n) => ({ x: n.x, y: n.y }))
+                )
+      }
+
+      // ── Room labels (floors 1-3 use polygon centroids) ───────────────────
+      roomPolygonsForSlab.forEach((room) => {
+        if (room.label && room.polygon.length > 0) {
+          const cx = room.polygon.reduce((s, p) => s + p[0], 0) / room.polygon.length
+          const cz = room.polygon.reduce((s, p) => s + p[1], 0) / room.polygon.length
+          floorGeom.createRoomLabel(room.label, cx * SCALE, cz * SCALE, floorNum, FLOOR_HEIGHT)
+        }
+      })
+
+      // ── Stairs ───────────────────────────────────────────────────────────
+      const MAIN_STAIR_IDS = new Set(['stairs_2', 'stairs_f1_1', 'stairs_f2_1', 'stairs_f3_1'])
+      const SIDE_STAIR_IDS = new Set(['stairs_1', 'stairs_f1_2', 'stairs_f2_2', 'stairs_f3_2'])
+
+      nodesOnFloor.filter((n) => n.type === 'stairs').forEach((stair) => {
+        let rotationY = 0
+        let nudge = { x: 0, z: 0 }
+        if (MAIN_STAIR_IDS.has(stair.id)) {
+          rotationY = Math.PI
+        } else if (SIDE_STAIR_IDS.has(stair.id)) {
+          rotationY = Math.PI / 2
+          nudge = { x: -55, z: 0 }
+        }
+        floorGeom.createStairMarker(stair.x * SCALE, stair.y * SCALE, floorNum, FLOOR_HEIGHT, rotationY, nudge)
+      })
+
+      // ── Elevator ─────────────────────────────────────────────────────────
+      nodesOnFloor.filter((n) => n.type === 'elevator').forEach((elev) =>
+        floorGeom.createElevatorMarker(elev.x * SCALE, elev.y * SCALE, floorNum, FLOOR_HEIGHT)
+      )
+
+      // ── Entrance markers ─────────────────────────────────────────────────
+      const GLASS_ENTRANCES: Record<string, { angleDeg: number; width: number }> = {
+        lobby_entrance: { angleDeg: -90, width: 100 },
+        side_entrance:  { angleDeg: -0, width: 80 },
+      }
+
+      nodesOnFloor.filter((n) => n.type === 'entrance').forEach((ent) => {
+        const glassCfg = GLASS_ENTRANCES[ent.id]
+        if (glassCfg) {
+          floorGeom.createGlassEntrance(
+            ent.x * SCALE,
+            ent.y * SCALE,
+            floorNum,
+            FLOOR_HEIGHT,
+            glassCfg.angleDeg,
+            glassCfg.width
+          )
+        } else {
+          // Fallback cylinder for emergency exit etc.
+          const mesh = new THREE.Mesh(
+            new THREE.CylinderGeometry(18, 18, 25, 16),
+            MAT_ENTRANCE
+          )
+          mesh.position.set(ent.x * SCALE + offX, yPos + 12, ent.y * SCALE + offZ)
+          mesh.userData.isBuilding = true
+          scene.add(mesh)
+        }
+      })
+      // ── Doors — snapped to wall, pushed outward toward corridor ──────────
+      nodesOnFloor.filter((n) => n.type === 'door').forEach((door) => {
+        let snapX = door.x * SCALE
+        let snapZ = door.y * SCALE
+        let bestDist = Infinity
+        let bestAngleDeg = 0
+
+        floorWalls.forEach((wall) => {
+          const wdx = wall.to[0] - wall.from[0]
+          const wdz = wall.to[1] - wall.from[1]
+          const len2 = wdx * wdx + wdz * wdz
+          if (len2 < 0.01) return
+          const t = Math.max(0.05, Math.min(0.95,
+            ((door.x - wall.from[0]) * wdx + (door.y - wall.from[1]) * wdz) / len2
+          ))
+          const px = (wall.from[0] + t * wdx) * SCALE
+          const pz = (wall.from[1] + t * wdz) * SCALE
+          const dist = Math.sqrt((px - door.x * SCALE) ** 2 + (pz - door.y * SCALE) ** 2)
+          if (dist < bestDist) {
+            bestDist = dist
+            snapX = px
+            snapZ = pz
+            bestAngleDeg = (Math.atan2(wdz, wdx) * 180) / Math.PI
+          }
+        })
+
+        // Push door outward past wall toward the corridor side
+        // Direction: from original door position through snap point and beyond
+        const ddx = snapX - door.x * SCALE
+        const ddz = snapZ - door.y * SCALE
+        const dlen = Math.sqrt(ddx * ddx + ddz * ddz) || 1
+        const outwardX = snapX + (ddx / dlen) * 6
+        const outwardZ = snapZ + (ddz / dlen) * 6
+
+        floorGeom.createDoorMarker(outwardX, outwardZ, floorNum, FLOOR_HEIGHT, bestAngleDeg)
+      })
+
+    })
+}
+  // ── Pathfinding ─────────────────────────────────────────────────────────────
   useEffect(() => {
     if (pathfinder && startRoom && endRoom) {
-      const result = pathfinder.findPath(startRoom, endRoom, requireAccessible)
+      console.log('Finding path:', startRoom, '->', endRoom)
+      const result = pathfinder.findPath(startRoom, endRoom, requireAccessible, useSideStairs)
+      console.log('Result:', result.found, 'path length:', result.path.length)
       if (result.found) {
         setPath(result.path)
-        console.log('Path found:', result.path.map(n => `${n.id} (${n.type})`).join(' → '))
-
-        // Draw path in 3D
-        if (sceneRef.current) {
-          drawPath3D(sceneRef.current, result.path)
-        }
+        const instrs = generateNavInstructions(result.path)
+        setNavInstructions(instrs)
+        if (!voiceMuted) speakInstructions(instrs)
+        if (sceneRef.current) drawPath3D(sceneRef.current, result.path)
       } else {
         setPath([])
       }
     }
   }, [startRoom, endRoom, requireAccessible, pathfinder])
 
-  // Draw 3D path
   const drawPath3D = (scene: THREE.Scene, pathNodes: PathNode[]) => {
     // Remove old path
-    const oldPath = scene.getObjectByName('pathLine')
-    if (oldPath) scene.remove(oldPath)
-
-    // Remove old path spheres
-    const oldSpheres = scene.children.filter(obj => obj.name.startsWith('pathSphere_'))
-    oldSpheres.forEach(sphere => scene.remove(sphere))
+    const old = scene.getObjectByName('pathLine')
+    if (old) scene.remove(old)
+    scene.children
+      .filter((o) => o.name.startsWith('pathSphere_'))
+      .forEach((o) => scene.remove(o))
 
     if (pathNodes.length < 2) return
 
-    // Same offset as building
-    const offsetX = -425
-    const offsetZ = -325
+    const getPos = (node: PathNode) => {
+      const off = floorOffsetsRef.current.get(node.floor) || { x: 0, z: 0 }
+      return new THREE.Vector3(
+        node.x * SCALE + off.x,
+        node.floor * FLOOR_HEIGHT + 6,
+        node.y * SCALE + off.z
+      )
+    }
 
-    // Create path line
-    const points = pathNodes.map(node =>
-      new THREE.Vector3(node.x + offsetX, node.floor * 150 + 60, node.y + offsetZ)
+    const points = pathNodes.map(getPos)
+    const line = new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints(points),
+      new THREE.LineBasicMaterial({ color: 0xff4444, linewidth: 6 })
     )
-
-    const geometry = new THREE.BufferGeometry().setFromPoints(points)
-    const material = new THREE.LineBasicMaterial({
-      color: 0xff4444,
-      linewidth: 5
-    })
-    const line = new THREE.Line(geometry, material)
     line.name = 'pathLine'
     scene.add(line)
 
-    // Add animated spheres along path
-    pathNodes.forEach((node, index) => {
-      const sphereGeometry = new THREE.SphereGeometry(5, 16, 16)
-      const sphereMaterial = new THREE.MeshStandardMaterial({
-        color: 0xff4444,
-        emissive: 0xff4444,
-        emissiveIntensity: 0.5
-      })
-      const sphere = new THREE.Mesh(sphereGeometry, sphereMaterial)
-      sphere.position.set(node.x + offsetX, node.floor * 150 + 60, node.y + offsetZ)
-      sphere.name = `pathSphere_${index}`
+    pathNodes.forEach((node, i) => {
+      const sphere = new THREE.Mesh(
+        new THREE.SphereGeometry(6, 14, 14),
+        MAT_PATH
+      )
+      sphere.position.copy(getPos(node))
+      sphere.name = `pathSphere_${i}`
       scene.add(sphere)
     })
   }
 
-  const allRoomNodes = graph?.getAllNodes().filter(n => n.type === 'room') || []
-  const entranceNodes = graph?.getAllNodes().filter(n => n.type === 'entrance') || []
+  // ── Floor toggle helpers ────────────────────────────────────────────────────
+  const toggleFloor = (f: number) =>
+    setVisibleFloors((prev) => {
+      const s = new Set(prev)
+      s.has(f) ? s.delete(f) : s.add(f)
+      return s
+    })
+  const toggleWalls = (f: number) =>
+    setFloorWallsVisible((prev) => ({ ...prev, [f]: !prev[f] }))
+  const toggleCeiling = (f: number) =>
+    setFloorCeilingsVisible((prev) => ({ ...prev, [f]: !prev[f] }))
+
+  // ── Walkthrough controls ────────────────────────────────────────────────────
+  const startWalkthrough = () => {
+    if (!walkthroughRef.current || path.length < 2) return
+    walkthroughRef.current.setPath(path)
+    setWalkthroughActive(true)
+    setWalkthroughPlaying(true)
+    walkthroughRef.current.play()
+  }
+  const pauseWalkthrough = () => {
+    walkthroughRef.current?.pause()
+    setWalkthroughPlaying(false)
+  }
+  const resumeWalkthrough = () => {
+    walkthroughRef.current?.play()
+    setWalkthroughPlaying(true)
+  }
+  const resetWalkthrough = () => {
+    walkthroughRef.current?.reset()
+    setWalkthroughActive(false)
+    setWalkthroughPlaying(false)
+    setWalkthroughProgress(0)
+    if (cameraRef.current && controlsRef.current) {
+      cameraRef.current.position.set(600, 900, 1200)
+      cameraRef.current.lookAt(0, 0, 0)
+      controlsRef.current.enabled = true
+    }
+  }
+  const changeWalkthroughSpeed = (s: number) => {
+    setWalkthroughSpeed(s)
+    walkthroughRef.current?.setSpeed(s)
+  }
 
   const clearPath = () => {
     setStartRoom('')
     setEndRoom('')
     setPath([])
-
+    setNavInstructions([])
+    stopSpeech()
     if (sceneRef.current) {
-      const oldPath = sceneRef.current.getObjectByName('pathLine')
-      if (oldPath) sceneRef.current.remove(oldPath)
-
-      // Remove path spheres
-      const spheres = sceneRef.current.children.filter(obj => obj.name.startsWith('pathSphere_'))
-      spheres.forEach(sphere => sceneRef.current?.remove(sphere))
+      const old = sceneRef.current.getObjectByName('pathLine')
+      if (old) sceneRef.current.remove(old)
+      sceneRef.current.children
+        .filter((o) => o.name.startsWith('pathSphere_'))
+        .forEach((o) => sceneRef.current!.remove(o))
     }
   }
 
-  // Walkthrough controls
-  const startWalkthrough = () => {
-    if (!walkthroughRef.current || path.length < 2) return
-
-    setWalkthroughActive(true)
-    setWalkthroughPlaying(true)
-    walkthroughRef.current.play()
-  }
-
-  const pauseWalkthrough = () => {
-    if (!walkthroughRef.current) return
-
-    setWalkthroughPlaying(false)
-    walkthroughRef.current.pause()
-  }
-
-  const resumeWalkthrough = () => {
-    if (!walkthroughRef.current) return
-
-    setWalkthroughPlaying(true)
-    walkthroughRef.current.play()
-  }
-
-  const resetWalkthrough = () => {
-    if (!walkthroughRef.current) return
-
-    walkthroughRef.current.reset()
-    setWalkthroughActive(false)
-    setWalkthroughPlaying(false)
-    setWalkthroughProgress(0)
-
-    // Reset camera to orbit view
-    if (cameraRef.current && controlsRef.current) {
-      cameraRef.current.position.set(400, 600, 800)
-      cameraRef.current.lookAt(0, 0, 0)
-      controlsRef.current.enabled = true
-    }
-  }
-
-  const changeWalkthroughSpeed = (speed: number) => {
-    if (!walkthroughRef.current) return
-
-    setWalkthroughSpeed(speed)
-    walkthroughRef.current.setSpeed(speed)
-  }
+const allRoomNodes = graph?.getAllNodes().filter((n) => n.type === 'room') ?? []
+const allDoorNodes = graph?.getAllNodes().filter((n) => n.type === 'door') ?? []
+const entranceNodes = graph?.getAllNodes().filter((n) => n.type === 'entrance') ?? []
+const allFloors = [0, 1, 2, 3]
+const floorLabels: Record<number, string> = { 0: 'Ground', 1: 'Floor 1', 2: 'Floor 2', 3: 'Floor 3' }
 
   return (
-    <div className="min-h-screen bg-gray-900 text-white">
+    <div style={{ height: '100vh', overflow: 'hidden', background: '#0a0e1a', display: 'flex', flexDirection: 'column', fontFamily: "'DM Sans', 'Segoe UI', sans-serif" }}>
+
       {/* Header */}
-      <div className="bg-gray-800 shadow-md p-4">
-        <div className="max-w-7xl mx-auto">
-          <div className="flex justify-between items-center mb-4">
-            <div className="flex items-center gap-4">
-              <button
-                onClick={() => navigate('/')}
-                className="text-green-400 hover:text-green-300 font-semibold"
-              >
-                ← Back to Search
-              </button>
-              <h1 className="text-2xl font-bold">3D Map Viewer</h1>
+      <div style={{ background: 'rgba(15,23,42,0.97)', borderBottom: '1px solid rgba(255,255,255,0.08)', backdropFilter: 'blur(12px)', padding: '12px 24px', flexShrink: 0 }}>
+        <div style={{ maxWidth: '1400px', margin: '0 auto' }}>
 
-              {/* Building Selector */}
-              <select
-                value={selectedBuilding}
-                onChange={(e) => setSelectedBuilding(e.target.value as 'example' | 'csis')}
-                className="px-4 py-2 bg-gray-700 border-2 border-green-600 text-white rounded-lg font-semibold focus:outline-none focus:ring-2 focus:ring-green-500"
-              >
-                <option value="example">Example Building</option>
-                <option value="csis">CSIS Building</option>
-              </select>
-
-              {/* Switch to 2D button */}
-              <button
-                onClick={() => navigate('/2d-viewer')}
-                className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg font-semibold flex items-center gap-2"
-              >
-                <span>🗺️</span>
-                <span>Switch to 2D</span>
-              </button>
+          {/* Top row */}
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '12px' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+              <button onClick={() => navigate('/')}
+                style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '8px', color: '#94a3b8', padding: '6px 14px', fontSize: '13px', cursor: 'pointer', fontWeight: 600 }}
+                onMouseEnter={e => (e.currentTarget.style.background = 'rgba(255,255,255,0.1)')}
+                onMouseLeave={e => (e.currentTarget.style.background = 'rgba(255,255,255,0.06)')}
+              >← Home</button>
+              <button onClick={() => navigate('/2d-viewer')}
+                style={{ background: 'linear-gradient(135deg,#3b82f6,#2563eb)', color: '#fff', border: 'none', borderRadius: '8px', padding: '6px 16px', fontSize: '13px', fontWeight: 600, cursor: 'pointer' }}
+                onMouseEnter={e => (e.currentTarget.style.opacity = '0.85')}
+                onMouseLeave={e => (e.currentTarget.style.opacity = '1')}
+              >📍 2D Map</button>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                <div style={{ width: '8px', height: '8px', borderRadius: '50%', background: '#22d3ee', boxShadow: '0 0 8px #22d3ee' }} />
+                <h1 style={{ fontSize: '18px', fontWeight: 700, color: '#f1f5f9', margin: 0 }}>CSIS Building — 3D Viewer</h1>
+              </div>
             </div>
 
-            {/* Floor Visibility Controls */}
-            <div className="flex gap-4 items-start">
-              <span className="text-gray-300 font-semibold mt-2">Floor Controls:</span>
-
-              {/* Ground Floor Controls */}
-              <div className="flex flex-col gap-1 bg-gray-800 p-2 rounded-lg">
-                <button
-                  onClick={() => toggleFloor(0)}
-                  className={`px-3 py-1 rounded text-sm font-semibold transition-colors ${
-                    visibleFloors.has(0)
-                      ? 'bg-green-600 hover:bg-green-700 text-white'
-                      : 'bg-gray-700 hover:bg-gray-600 text-gray-400'
-                  }`}
-                >
-                  Ground Floor
-                </button>
-                <div className="flex gap-1">
-                  <button
-                    onClick={() => toggleFloorWalls(0)}
-                    disabled={!visibleFloors.has(0)}
-                    className={`px-2 py-1 rounded text-xs font-semibold transition-colors ${
-                      visibleFloors.has(0) && floorWallsVisible[0]
-                        ? 'bg-blue-600 hover:bg-blue-700 text-white'
-                        : 'bg-gray-700 text-gray-500'
-                    }`}
-                  >
-                    Walls
-                  </button>
-                  <button
-                    onClick={() => toggleFloorCeiling(0)}
-                    disabled={!visibleFloors.has(0)}
-                    className={`px-2 py-1 rounded text-xs font-semibold transition-colors ${
-                      visibleFloors.has(0) && floorCeilingsVisible[0]
-                        ? 'bg-blue-600 hover:bg-blue-700 text-white'
-                        : 'bg-gray-700 text-gray-500'
-                    }`}
-                  >
-                    Ceiling
-                  </button>
+            {/* Floor toggles */}
+            <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
+              {allFloors.map((f) => (
+                <div key={f} style={{ display: 'flex', alignItems: 'center', gap: '4px', background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.08)', borderRadius: '8px', padding: '4px 8px' }}>
+                  <button onClick={() => toggleFloor(f)}
+                    style={{ background: visibleFloors.has(f) ? 'rgba(59,130,246,0.3)' : 'transparent', border: visibleFloors.has(f) ? '1px solid rgba(59,130,246,0.5)' : '1px solid transparent', borderRadius: '6px', color: visibleFloors.has(f) ? '#93c5fd' : '#475569', padding: '3px 8px', fontSize: '12px', fontWeight: 700, cursor: 'pointer' }}
+                  >{floorLabels[f]}</button>
+                  <button onClick={() => toggleWalls(f)} disabled={!visibleFloors.has(f)}
+                    style={{ background: visibleFloors.has(f) && floorWallsVisible[f] ? 'rgba(234,179,8,0.25)' : 'transparent', border: 'none', borderRadius: '4px', color: visibleFloors.has(f) && floorWallsVisible[f] ? '#fde047' : '#334155', padding: '3px 6px', fontSize: '11px', cursor: 'pointer' }}
+                  >Walls</button>
+                  <button onClick={() => toggleCeiling(f)} disabled={!visibleFloors.has(f)}
+                    style={{ background: visibleFloors.has(f) && floorCeilingsVisible[f] ? 'rgba(59,130,246,0.25)' : 'transparent', border: 'none', borderRadius: '4px', color: visibleFloors.has(f) && floorCeilingsVisible[f] ? '#93c5fd' : '#334155', padding: '3px 6px', fontSize: '11px', cursor: 'pointer' }}
+                  >Ceil</button>
                 </div>
-              </div>
-
-              {/* Floor 1 Controls */}
-              <div className="flex flex-col gap-1 bg-gray-800 p-2 rounded-lg">
-                <button
-                  onClick={() => toggleFloor(1)}
-                  className={`px-3 py-1 rounded text-sm font-semibold transition-colors ${
-                    visibleFloors.has(1)
-                      ? 'bg-green-600 hover:bg-green-700 text-white'
-                      : 'bg-gray-700 hover:bg-gray-600 text-gray-400'
-                  }`}
-                >
-                  Floor 1
-                </button>
-                <div className="flex gap-1">
-                  <button
-                    onClick={() => toggleFloorWalls(1)}
-                    disabled={!visibleFloors.has(1)}
-                    className={`px-2 py-1 rounded text-xs font-semibold transition-colors ${
-                      visibleFloors.has(1) && floorWallsVisible[1]
-                        ? 'bg-blue-600 hover:bg-blue-700 text-white'
-                        : 'bg-gray-700 text-gray-500'
-                    }`}
-                  >
-                    Walls
-                  </button>
-                  <button
-                    onClick={() => toggleFloorCeiling(1)}
-                    disabled={!visibleFloors.has(1)}
-                    className={`px-2 py-1 rounded text-xs font-semibold transition-colors ${
-                      visibleFloors.has(1) && floorCeilingsVisible[1]
-                        ? 'bg-blue-600 hover:bg-blue-700 text-white'
-                        : 'bg-gray-700 text-gray-500'
-                    }`}
-                  >
-                    Ceiling
-                  </button>
-                </div>
-              </div>
-
-              <button
-                onClick={() => setVisibleFloors(new Set([0, 1]))}
-                className="bg-purple-600 hover:bg-purple-700 text-white px-4 py-2 rounded-lg font-semibold mt-6"
-              >
-                Show All
-              </button>
+              ))}
+              <button onClick={() => setVisibleFloors(new Set(allFloors))}
+                style={{ background: 'rgba(168,85,247,0.2)', border: '1px solid rgba(168,85,247,0.4)', borderRadius: '8px', color: '#c084fc', padding: '6px 12px', fontSize: '12px', fontWeight: 600, cursor: 'pointer' }}
+              >All Floors</button>
             </div>
           </div>
 
-          {/* Room Selection Controls */}
-          <div className="grid grid-cols-3 gap-4">
-            <div>
-              <label className="block text-sm font-semibold mb-2">Start Location</label>
-              <select
-                value={startRoom}
-                onChange={(e) => setStartRoom(e.target.value)}
-                className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+          {/* Controls row */}
+          <div style={{ display: 'flex', gap: '10px', alignItems: 'flex-end', flexWrap: 'wrap' }}>
+            {/* Start */}
+            <div style={{ flex: 1, minWidth: '200px' }}>
+              <div style={{ fontSize: '11px', fontWeight: 600, color: '#475569', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: '4px' }}>Start</div>
+              <select value={startRoom} onChange={(e) => setStartRoom(e.target.value)}
+                style={{ width: '100%', background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.12)', borderRadius: '8px', color: '#f1f5f9', padding: '7px 10px', fontSize: '13px', outline: 'none', cursor: 'pointer' }}
               >
-                <option value="">Select start...</option>
+                <option value="" style={{ background: '#1e293b' }}>Select start…</option>
                 <optgroup label="Entrances">
-                  {entranceNodes.map(node => (
-                    <option key={node.id} value={node.id}>
-                      {node.label || node.id}
-                    </option>
-                  ))}
+                  {entranceNodes.map((n) => <option key={n.id} value={n.id} style={{ background: '#1e293b' }}>{n.label || n.id}</option>)}
                 </optgroup>
                 <optgroup label="Rooms">
-                  {allRoomNodes.map(node => (
-                    <option key={node.id} value={node.id}>
-                      {node.label || node.id} (Floor {node.floor === 0 ? 'G' : node.floor})
-                    </option>
-                  ))}
+                  {allDoorNodes.map((n) => <option key={n.id} value={n.id} style={{ background: '#1e293b' }}>{n.label || n.id} ({floorLabels[n.floor] ?? `Floor ${n.floor}`})</option>)}
                 </optgroup>
               </select>
             </div>
 
-            <div>
-              <label className="block text-sm font-semibold mb-2">Destination</label>
-              <select
-                value={endRoom}
-                onChange={(e) => setEndRoom(e.target.value)}
-                className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+            {/* Destination */}
+            <div style={{ flex: 1, minWidth: '200px' }}>
+              <div style={{ fontSize: '11px', fontWeight: 600, color: '#475569', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: '4px' }}>Destination</div>
+              <select value={endRoom} onChange={(e) => setEndRoom(e.target.value)}
+                style={{ width: '100%', background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.12)', borderRadius: '8px', color: '#f1f5f9', padding: '7px 10px', fontSize: '13px', outline: 'none', cursor: 'pointer' }}
               >
-                <option value="">Select destination...</option>
-                {allRoomNodes.map(node => (
-                  <option key={node.id} value={node.id}>
-                    {node.label || node.id} (Floor {node.floor === 0 ? 'G' : node.floor})
-                  </option>
-                ))}
+                <option value="" style={{ background: '#1e293b' }}>Select destination…</option>
+                {allDoorNodes.map((n) => <option key={n.id} value={n.id} style={{ background: '#1e293b' }}>{n.label || n.id} ({floorLabels[n.floor] ?? `Floor ${n.floor}`})</option>)}
               </select>
             </div>
 
-            <div className="flex items-end gap-2">
-              <label className="flex items-center gap-2">
-                <input
-                  type="checkbox"
-                  checked={requireAccessible}
-                  onChange={(e) => setRequireAccessible(e.target.checked)}
-                  className="w-4 h-4"
-                />
-                <span className="text-sm">Accessible Route</span>
-              </label>
+            {/* Options */}
+            <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
               <button
-                onClick={clearPath}
-                className="bg-red-500 hover:bg-red-600 text-white px-4 py-2 rounded"
-              >
-                Clear
-              </button>
+                onClick={() => { setUseSideStairs(!useSideStairs); if (!useSideStairs) setRequireAccessible(false) }}
+                style={{ background: useSideStairs ? 'rgba(249,115,22,0.2)' : 'rgba(255,255,255,0.06)', border: useSideStairs ? '1px solid rgba(249,115,22,0.4)' : '1px solid rgba(255,255,255,0.1)', borderRadius: '8px', color: useSideStairs ? '#fb923c' : '#64748b', padding: '7px 14px', fontSize: '13px', fontWeight: 600, cursor: 'pointer' }}
+              >{useSideStairs ? '✓ ' : ''}Side Stairs</button>
+              <button
+                onClick={() => { setRequireAccessible(!requireAccessible); if (!requireAccessible) setUseSideStairs(false) }}
+                style={{ background: requireAccessible ? 'rgba(34,197,94,0.2)' : 'rgba(255,255,255,0.06)', border: requireAccessible ? '1px solid rgba(34,197,94,0.4)' : '1px solid rgba(255,255,255,0.1)', borderRadius: '8px', color: requireAccessible ? '#4ade80' : '#64748b', padding: '7px 14px', fontSize: '13px', fontWeight: 600, cursor: 'pointer' }}
+              >{requireAccessible ? '✓ ' : ''}Elevator Priority</button>
+              <button onClick={clearPath}
+                style={{ background: 'rgba(239,68,68,0.15)', border: '1px solid rgba(239,68,68,0.3)', borderRadius: '8px', color: '#f87171', padding: '7px 14px', fontSize: '13px', fontWeight: 600, cursor: 'pointer' }}
+              >Clear</button>
             </div>
           </div>
 
+          {/* Path info + walkthrough */}
           {path.length > 0 && (
-            <div className="mt-4 p-3 bg-blue-900 bg-opacity-50 rounded-lg">
-              <p className="text-sm font-semibold text-blue-200">
-                Path found: {path.length} steps
-                {path.some(n => n.type === 'stairs') && ' (via stairs)'}
-                {path.some(n => n.type === 'elevator') && ' (via elevator)'}
-                {' • '}
-                Floors: {Array.from(new Set(path.map(n => n.floor))).map(f => f === 0 ? 'Ground' : `Floor ${f}`).join(', ')}
-              </p>
+            <div style={{ marginTop: '10px', background: 'rgba(59,130,246,0.08)', border: '1px solid rgba(59,130,246,0.2)', borderRadius: '10px', padding: '10px 16px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '8px' }}>
+                <span style={{ fontSize: '13px', color: '#93c5fd', fontWeight: 600 }}>
+                  {path.length} steps
+                  {path.some((n) => n.type === 'stairs') && ' · via stairs'}
+                  {path.some((n) => n.type === 'elevator') && ' · via lift'}
+                  {' · '}
+                  {[...new Set(path.map((n) => n.floor))].map((f) => floorLabels[f] ?? `Floor ${f}`).join(', ')}
+                </span>
 
-              {/* Walkthrough Controls */}
-              <div className="mt-3 pt-3 border-t border-blue-700">
-                <div className="flex items-center gap-3 flex-wrap">
+                {/* Walkthrough controls */}
+                <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
                   {!walkthroughActive ? (
-                    <button
-                      onClick={startWalkthrough}
-                      className="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded-lg font-semibold flex items-center gap-2"
-                    >
-                      <span>▶️</span>
-                      <span>Start Walkthrough</span>
-                    </button>
+                    <button onClick={startWalkthrough}
+                      style={{ background: 'linear-gradient(135deg,#10b981,#059669)', color: '#fff', border: 'none', borderRadius: '8px', padding: '7px 18px', fontSize: '13px', fontWeight: 700, cursor: 'pointer' }}
+                    >▶ Start Walkthrough</button>
                   ) : (
                     <>
-                      {walkthroughPlaying ? (
-                        <button
-                          onClick={pauseWalkthrough}
-                          className="bg-yellow-600 hover:bg-yellow-700 text-white px-4 py-2 rounded-lg font-semibold flex items-center gap-2"
-                        >
-                          <span>⏸️</span>
-                          <span>Pause</span>
-                        </button>
-                      ) : (
-                        <button
-                          onClick={resumeWalkthrough}
-                          className="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded-lg font-semibold flex items-center gap-2"
-                        >
-                          <span>▶️</span>
-                          <span>Resume</span>
-                        </button>
-                      )}
-
-                      <button
-                        onClick={resetWalkthrough}
-                        className="bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded-lg font-semibold flex items-center gap-2"
-                      >
-                        <span>🔄</span>
-                        <span>Reset</span>
-                      </button>
-
-                      {/* Speed Control */}
-                      <div className="flex items-center gap-2 bg-gray-700 px-3 py-2 rounded-lg">
-                        <span className="text-sm text-gray-300">Speed:</span>
-                        <button
-                          onClick={() => changeWalkthroughSpeed(0.5)}
-                          className={`px-2 py-1 rounded ${walkthroughSpeed === 0.5 ? 'bg-blue-600' : 'bg-gray-600 hover:bg-gray-500'}`}
-                        >
-                          0.5x
-                        </button>
-                        <button
-                          onClick={() => changeWalkthroughSpeed(1.0)}
-                          className={`px-2 py-1 rounded ${walkthroughSpeed === 1.0 ? 'bg-blue-600' : 'bg-gray-600 hover:bg-gray-500'}`}
-                        >
-                          1x
-                        </button>
-                        <button
-                          onClick={() => changeWalkthroughSpeed(2.0)}
-                          className={`px-2 py-1 rounded ${walkthroughSpeed === 2.0 ? 'bg-blue-600' : 'bg-gray-600 hover:bg-gray-500'}`}
-                        >
-                          2x
-                        </button>
+                      {walkthroughPlaying
+                        ? <button onClick={pauseWalkthrough} style={{ background: 'rgba(234,179,8,0.2)', border: '1px solid rgba(234,179,8,0.4)', borderRadius: '8px', color: '#fde047', padding: '7px 14px', fontSize: '13px', fontWeight: 600, cursor: 'pointer' }}>⏸ Pause</button>
+                        : <button onClick={resumeWalkthrough} style={{ background: 'rgba(16,185,129,0.2)', border: '1px solid rgba(16,185,129,0.4)', borderRadius: '8px', color: '#34d399', padding: '7px 14px', fontSize: '13px', fontWeight: 600, cursor: 'pointer' }}>▶ Resume</button>
+                      }
+                      <button onClick={resetWalkthrough} style={{ background: 'rgba(239,68,68,0.15)', border: '1px solid rgba(239,68,68,0.3)', borderRadius: '8px', color: '#f87171', padding: '7px 14px', fontSize: '13px', fontWeight: 600, cursor: 'pointer' }}>🔄 Reset</button>
+                      <div style={{ display: 'flex', gap: '4px', alignItems: 'center', background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.08)', borderRadius: '8px', padding: '4px 8px' }}>
+                        <span style={{ fontSize: '12px', color: '#475569', marginRight: '4px' }}>Speed:</span>
+                        {[1.0, 2.0, 4.0].map((s) => (
+                          <button key={s} onClick={() => changeWalkthroughSpeed(s)}
+                            style={{ background: walkthroughSpeed === s ? 'rgba(59,130,246,0.3)' : 'transparent', border: walkthroughSpeed === s ? '1px solid rgba(59,130,246,0.5)' : '1px solid transparent', borderRadius: '6px', color: walkthroughSpeed === s ? '#93c5fd' : '#475569', padding: '3px 8px', fontSize: '12px', fontWeight: 600, cursor: 'pointer' }}
+                          >{s}x</button>
+                        ))}
                       </div>
-
-                      {/* Progress Bar */}
-                      <div className="flex-grow min-w-[200px]">
-                        <div className="flex items-center gap-2">
-                          <div className="flex-grow bg-gray-700 rounded-full h-2">
-                            <div
-                              className="bg-green-500 h-2 rounded-full transition-all duration-300"
-                              style={{ width: `${walkthroughProgress * 100}%` }}
-                            />
-                          </div>
-                          <span className="text-sm text-gray-300">
-                            {Math.round(walkthroughProgress * 100)}%
-                          </span>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: '140px' }}>
+                        <div style={{ flex: 1, background: 'rgba(255,255,255,0.08)', borderRadius: '999px', height: '6px' }}>
+                          <div style={{ background: 'linear-gradient(90deg,#10b981,#06b6d4)', height: '6px', borderRadius: '999px', width: `${walkthroughProgress * 100}%`, transition: 'width 0.3s' }} />
                         </div>
+                        <span style={{ fontSize: '12px', color: '#475569' }}>{Math.round(walkthroughProgress * 100)}%</span>
                       </div>
                     </>
                   )}
                 </div>
               </div>
+
+              {/* Navigation Instructions */}
+              {navInstructions.length > 0 && (
+                <div style={{ marginTop: '8px', borderTop: '1px solid rgba(59,130,246,0.2)', paddingTop: '8px' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '6px' }}>
+                    <button onClick={() => setShowInstructions(v => !v)}
+                      style={{ background: 'none', border: 'none', color: '#93c5fd', fontSize: '12px', cursor: 'pointer', textDecoration: 'underline', padding: 0 }}
+                    >{showInstructions ? 'Hide' : 'Show'} directions ({navInstructions.length} steps)</button>
+                    <button
+                      onClick={() => { const next = !voiceMuted; setVoiceMuted(next); if (next) stopSpeech(); else speakInstructions(navInstructions) }}
+                      style={{ background: voiceMuted ? 'rgba(255,255,255,0.06)' : 'rgba(59,130,246,0.25)', border: voiceMuted ? '1px solid rgba(255,255,255,0.1)' : '1px solid rgba(59,130,246,0.4)', borderRadius: '6px', color: voiceMuted ? '#475569' : '#93c5fd', padding: '2px 10px', fontSize: '12px', fontWeight: 600, cursor: 'pointer' }}
+                    >{voiceMuted ? '🔇 Muted' : '🔊 Speaking'}</button>
+                  </div>
+                  {showInstructions && (
+                    <ol style={{ margin: 0, padding: 0, listStyle: 'none', maxHeight: '90px', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '3px' }}>
+                      {navInstructions.map((instr) => (
+                        <li key={instr.step} style={{ display: 'flex', gap: '8px', fontSize: '12px', color: '#94a3b8' }}>
+                          <span style={{ color: '#475569', minWidth: '16px' }}>{instr.step}.</span>
+                          <span>{instr.icon} {instr.text}</span>
+                        </li>
+                      ))}
+                    </ol>
+                  )}
+                </div>
+              )}
             </div>
           )}
         </div>
       </div>
 
-      {/* 3D Canvas Container */}
-      <div
-        ref={containerRef}
-        className="w-full"
-        style={{ height: 'calc(100vh - 220px)' }}
-      />
+      {/* Three.js canvas */}
+      <div ref={containerRef} style={{ flex: 1 }} />
 
-      {/* Controls Info */}
-      <div className="absolute bottom-4 left-4 bg-gray-800 bg-opacity-90 p-4 rounded-lg shadow-lg max-w-xs">
-        <p className="text-sm text-gray-300">
-          <strong>Controls:</strong><br/>
-          • Left click + drag to rotate<br/>
-          • Right click + drag to pan<br/>
-          • Scroll to zoom<br/>
-          • Toggle floor buttons to show/hide floors<br/>
-          • Select rooms to see 3D path<br/>
-          • Click "Start Walkthrough" for first-person guided tour!
-        </p>
+      {/* Stair transition overlay */}
+      {stairTransitionMsg && (
+        <div style={{ position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%,-50%)', background: 'rgba(10,14,26,0.92)', border: '1px solid rgba(59,130,246,0.4)', borderRadius: '14px', color: '#f1f5f9', padding: '20px 36px', fontSize: '17px', fontWeight: 700, pointerEvents: 'none', boxShadow: '0 0 40px rgba(59,130,246,0.2)', backdropFilter: 'blur(12px)' }}>
+          {stairTransitionMsg}
+        </div>
+      )}
+
+      {/* Controls hint */}
+      <div style={{ position: 'absolute', bottom: '16px', left: '16px', background: 'rgba(15,23,42,0.85)', border: '1px solid rgba(255,255,255,0.08)', borderRadius: '10px', padding: '10px 14px', fontSize: '12px', color: '#475569', pointerEvents: 'none', backdropFilter: 'blur(8px)', lineHeight: 1.6 }}>
+        <span style={{ color: '#64748b', fontWeight: 600 }}>Controls: </span>Left-drag rotate · Right-drag pan · Scroll zoom<br />
+        Toggle floors · Select rooms · Walkthrough for first-person view
       </div>
     </div>
   )

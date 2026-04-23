@@ -17,22 +17,12 @@ export class Graph {
   }
 
   addEdge(edge: PathEdge): void {
-    // Add edge in both directions (bidirectional graph)
-    const forwardEdge = edge
-    const reverseEdge: PathEdge = {
-      from: edge.to,
-      to: edge.from,
-      weight: edge.weight,
-      accessible: edge.accessible
-    }
-
+    const normalised = { ...edge, weight: edge.weight ?? 1 }
     const fromEdges = this.adjacencyList.get(edge.from) || []
-    fromEdges.push(forwardEdge)
-    this.adjacencyList.set(edge.from, fromEdges)
-
-    const toEdges = this.adjacencyList.get(edge.to) || []
-    toEdges.push(reverseEdge)
-    this.adjacencyList.set(edge.to, toEdges)
+    if (!fromEdges.some(e => e.to === edge.to)) {
+      fromEdges.push(normalised)
+      this.adjacencyList.set(edge.from, fromEdges)
+    }
   }
 
   getNode(id: string): PathNode | undefined {
@@ -59,7 +49,7 @@ export class Graph {
     if (!node1 || !node2) return Infinity
 
     // Add floor penalty if on different floors
-    const floorPenalty = Math.abs(node1.floor - node2.floor) * 50
+    const floorPenalty = Math.abs(node1.floor - node2.floor) * 200
 
     const dx = node1.x - node2.x
     const dy = node1.y - node2.y
